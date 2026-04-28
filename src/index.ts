@@ -303,12 +303,7 @@ function hasExplicitCleanupScope(args: CliArgs): boolean {
 }
 
 async function confirmCleanup(scope: CleanupScope, targets: ReadonlyArray<CleanupTarget>, yes: boolean): Promise<boolean> {
-  const needsConfirmation =
-    scope.kind === "all" ||
-    scope.kind === "repo" ||
-    (scope.kind === "slug" && scope.number === undefined) ||
-    targets.length > 1;
-  if (!needsConfirmation || yes) return true;
+  if (!needsCleanupConfirmation(scope, targets) || yes) return true;
 
   if (!process.stdin.isTTY) {
     throw new Error(`Refusing to remove ${formatCount(targets.length)} in non-interactive mode. Pass --yes to confirm.`);
@@ -323,6 +318,12 @@ async function confirmCleanup(scope: CleanupScope, targets: ReadonlyArray<Cleanu
   } finally {
     rl.close();
   }
+}
+
+function needsCleanupConfirmation(scope: CleanupScope, targets: ReadonlyArray<CleanupTarget>): boolean {
+  if (scope.kind === "all" || scope.kind === "repo") return true;
+  if (scope.kind === "slug" && scope.number === undefined) return true;
+  return targets.length > 1;
 }
 
 function cleanupScope(args: CliArgs): CleanupScope {

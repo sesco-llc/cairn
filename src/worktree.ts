@@ -44,6 +44,11 @@ interface CleanupOptions {
   dryRun: boolean;
 }
 
+interface IndexedCleanupTarget {
+  target: CleanupTarget;
+  index: number;
+}
+
 interface RunOptions {
   cwd?: string;
 }
@@ -226,40 +231,33 @@ export async function listCleanupTargets(scope: CleanupScope): Promise<CleanupTa
     .sort((a, b) => a.localeCompare(b));
 
   const nestedTargets = await Promise.all(
-    slugNames.map(async (slug) => {
-      const slugDir = path.join(root, slug);
-      const numberEntries = await fs.readdir(slugDir, { withFileTypes: true }).catch(() => []);
-      const numberNames = numberEntries
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name)
-        .filter((numberName) => /^\d+$/.test(numberName))
-        .filter((numberName) => matchesNumber(scope, Number(numberName)))
-        .sort((a, b) => Number(a) - Number(b));
-
-      const targets = await Promise.all(
-        numberNames.map((numberName) => buildCleanupTarget(scope, slug, Number(numberName), path.join(slugDir, numberName))),
-      );
-      return targets.filter((target): target is CleanupTarget => target !== null);
-    }),
+    slugNames.map((slug) => listCleanupTargetsForSlug(scope, root, slug)),
   );
 
   return nestedTargets.flat();
+}
+
+async function listCleanupTargetsForSlug(scope: CleanupScope, root: string, slug: string): Promise<CleanupTarget[]> {
+  const slugDir = path.join(root, slug);
+  const numberEntries = await fs.readdir(slugDir, { withFileTypes: true }).catch(() => []);
+  const numberNames = numberEntries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((numberName) => /^\d+$/.test(numberName))
+    .filter((numberName) => matchesNumber(scope, Number(numberName)))
+    .sort((a, b) => Number(a) - Number(b));
+
+  const targets = await Promise.all(
+    numberNames.map((numberName) => buildCleanupTarget(scope, slug, Number(numberName), path.join(slugDir, numberName))),
+  );
+  return targets.filter((target): target is CleanupTarget => target !== null);
 }
 
 export async function cleanupTargets(targets: CleanupTarget[], options: CleanupOptions): Promise<CleanupResult[]> {
   if (!options.dryRun) targets.forEach(assertSafeCleanupPath);
 
   const indexedTargets = targets.map((target, index) => ({ target, index }));
-  const initialGroups: Record<string, typeof indexedTargets> = {};
-  const groups = Object.values(
-    indexedTargets.reduce((grouped, item) => {
-      const groupKey = item.target.localClonePath ?? "__cairn_missing_parent_clone__";
-      return {
-        ...grouped,
-        [groupKey]: [...(grouped[groupKey] ?? []), item],
-      };
-    }, initialGroups),
-  );
+  const groups = groupTargetsByParentClone(indexedTargets);
   const results: Array<CleanupResult | undefined> = new Array(targets.length);
 
   await Promise.all(
@@ -275,6 +273,19 @@ export async function cleanupTargets(targets: CleanupTarget[], options: CleanupO
     if (result === undefined) throw new Error("cleanup result missing");
     return result;
   });
+}
+
+function groupTargetsByParentClone(items: ReadonlyArray<IndexedCleanupTarget>): IndexedCleanupTarget[][] {
+  const initialGroups: Record<string, IndexedCleanupTarget[]> = {};
+  return Object.values(
+    items.reduce((grouped, item) => {
+      const groupKey = item.target.localClonePath ?? "__cairn_missing_parent_clone__";
+      return {
+        ...grouped,
+        [groupKey]: [...(grouped[groupKey] ?? []), item],
+      };
+    }, initialGroups),
+  );
 }
 
 async function cleanupTarget(target: CleanupTarget, options: CleanupOptions): Promise<CleanupResult> {
