@@ -1,0 +1,28 @@
+{
+  "name": "cairn-app",
+  "version": "0.1.0",
+  "description": "AI-era PR review CLI — splits a pull request into an ordered Review Path",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "cairn-app": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.40.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.0"
+  },
+  "packageManager": "pnpm@10.30.3",
+  "engines": {
+    "node": ">=18"
+  }
+}
