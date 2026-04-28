@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -184,31 +185,33 @@ export async function addWorktreeFromLocal(
   headSha: string,
   log: (msg: string) => void = () => {},
 ): Promise<WorktreeInfo> {
-  const worktreePath = worktreePathForPR(owner, repo, number);
-  await fs.mkdir(path.dirname(worktreePath), { recursive: true });
+  return withCloneLock(localClonePath, async () => {
+    const worktreePath = worktreePathForPR(owner, repo, number);
+    await fs.mkdir(path.dirname(worktreePath), { recursive: true });
 
-  log(`fetching PR #${number} into ${path.basename(localClonePath)}…`);
-  // Fetch the PR ref. Either pull/<n>/head or the SHA itself.
-  try {
-    await run("git", ["fetch", "origin", `pull/${number}/head`, "--quiet"], { cwd: localClonePath });
-  } catch {
-    await run("git", ["fetch", "origin", headSha, "--quiet"], { cwd: localClonePath });
-  }
-
-  if (await pathExists(worktreePath)) {
-    const currentSha = (await run("git", ["rev-parse", "HEAD"], { cwd: worktreePath })).trim();
-    if (currentSha !== headSha) {
-      log(`updating worktree to ${headSha.slice(0, 7)}…`);
-      await run("git", ["reset", "--hard", headSha], { cwd: worktreePath });
-    } else {
-      log(`worktree already at ${headSha.slice(0, 7)}`);
+    log(`fetching PR #${number} into ${path.basename(localClonePath)}…`);
+    // Fetch the PR ref. Either pull/<n>/head or the SHA itself.
+    try {
+      await run("git", ["fetch", "origin", `pull/${number}/head`, "--quiet"], { cwd: localClonePath });
+    } catch {
+      await run("git", ["fetch", "origin", headSha, "--quiet"], { cwd: localClonePath });
     }
-  } else {
-    log(`creating worktree at ${worktreePath}…`);
-    await run("git", ["worktree", "add", "--detach", worktreePath, headSha], { cwd: localClonePath });
-  }
 
-  return { worktreePath, localClonePath, headSha, ephemeral: false };
+    if (await pathExists(worktreePath)) {
+      const currentSha = (await run("git", ["rev-parse", "HEAD"], { cwd: worktreePath })).trim();
+      if (currentSha !== headSha) {
+        log(`updating worktree to ${headSha.slice(0, 7)}…`);
+        await run("git", ["reset", "--hard", headSha], { cwd: worktreePath });
+      } else {
+        log(`worktree already at ${headSha.slice(0, 7)}`);
+      }
+    } else {
+      log(`creating worktree at ${worktreePath}…`);
+      await run("git", ["worktree", "add", "--detach", worktreePath, headSha], { cwd: localClonePath });
+    }
+
+    return { worktreePath, localClonePath, headSha, ephemeral: false };
+  });
 }
 
 export async function listCleanupTargets(scope: CleanupScope): Promise<CleanupTarget[]> {
@@ -233,9 +236,10 @@ export async function listCleanupTargets(scope: CleanupScope): Promise<CleanupTa
         .filter((numberName) => matchesNumber(scope, Number(numberName)))
         .sort((a, b) => Number(a) - Number(b));
 
-      return Promise.all(
+      const targets = await Promise.all(
         numberNames.map((numberName) => buildCleanupTarget(scope, slug, Number(numberName), path.join(slugDir, numberName))),
       );
+      return targets.filter((target): target is CleanupTarget => target !== null);
     }),
   );
 
@@ -281,20 +285,16 @@ async function cleanupTarget(target: CleanupTarget, options: CleanupOptions): Pr
   const worktreePath = assertSafeCleanupPath(target);
 
   if (target.localClonePath) {
-    try {
-      await run("git", ["worktree", "remove", "--force", worktreePath], { cwd: target.localClonePath });
-      await removeEmptyParents(worktreePath);
-      return { ...target, method: "git-worktree-remove", removed: true, warning: null };
-    } catch (err) {
-      await fs.rm(worktreePath, { recursive: true, force: true });
-      await removeEmptyParents(worktreePath);
-      return {
-        ...target,
-        method: "rm-rf",
-        removed: true,
-        warning: `git worktree remove failed for ${target.worktreePath}; removed directory with rm -rf. Run git worktree prune in the parent clone if stale entries remain. ${errorMessage(err)}`,
-      };
-    }
+    const localClonePath = target.localClonePath;
+    return withCloneLock(localClonePath, async () => {
+      try {
+        await run("git", ["worktree", "remove", "--force", worktreePath], { cwd: localClonePath });
+        await removeEmptyParents(worktreePath);
+        return { ...target, method: "git-worktree-remove", removed: true, warning: null };
+      } catch (err) {
+        throw new Error(`git worktree remove failed for ${target.worktreePath}; no files were removed. ${errorMessage(err)}`);
+      }
+    });
   }
 
   await fs.rm(worktreePath, { recursive: true, force: true });
@@ -308,7 +308,7 @@ async function cleanupTarget(target: CleanupTarget, options: CleanupOptions): Pr
 }
 
 function assertSafeCleanupPath(target: CleanupTarget): string {
-  const root = path.resolve(worktreesRoot());
+  const root = assertSafeWorktreesRoot();
   const worktreePath = path.resolve(target.worktreePath);
   const rootPrefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
 
@@ -317,6 +317,18 @@ function assertSafeCleanupPath(target: CleanupTarget): string {
   }
 
   return worktreePath;
+}
+
+function assertSafeWorktreesRoot(): string {
+  const root = path.resolve(worktreesRoot());
+  const systemRoot = path.parse(root).root;
+  const unsafeRoots = new Set([systemRoot, path.resolve(os.homedir()), path.resolve(os.tmpdir())]);
+
+  if (unsafeRoots.has(root)) {
+    throw new Error(`Refusing to use unsafe worktrees root for destructive cleanup: ${root}`);
+  }
+
+  return root;
 }
 
 function matchesSlug(scope: CleanupScope, slug: string): boolean {
@@ -336,20 +348,57 @@ async function buildCleanupTarget(
   slug: string,
   number: number,
   worktreePath: string,
-): Promise<CleanupTarget> {
+): Promise<CleanupTarget | null> {
   const repoFromScope = repoSpecifierFromScope(scope);
-  const repoFromRemote = repoFromScope ?? (await readRepoFromWorktree(worktreePath));
-  const localClonePath = repoFromRemote ? await findLocalClone(repoFromRemote.owner, repoFromRemote.repo) : null;
+  const repoFromRemote = await readRepoFromWorktree(worktreePath);
+  if (repoFromScope && repoFromRemote && !sameRepo(repoFromScope, repoFromRemote)) return null;
+
+  const repo = repoFromScope ?? repoFromRemote;
+  const localClonePath = repo ? await findLocalClone(repo.owner, repo.repo) : null;
 
   return {
     slug,
     number,
     worktreePath,
     sizeBytes: await diskUsageBytes(worktreePath),
-    owner: repoFromRemote?.owner ?? null,
-    repo: repoFromRemote?.repo ?? null,
+    owner: repo?.owner ?? null,
+    repo: repo?.repo ?? null,
     localClonePath,
   };
+}
+
+function sameRepo(a: RepoSpecifier, b: RepoSpecifier): boolean {
+  return a.owner === b.owner && a.repo === b.repo;
+}
+
+async function withCloneLock<T>(localClonePath: string, action: () => Promise<T>): Promise<T> {
+  const lockName = createHash("sha256").update(path.resolve(localClonePath)).digest("hex");
+  const lockDir = path.join(worktreesRoot(), ".locks", lockName);
+  await acquireLock(lockDir);
+  try {
+    return await action();
+  } finally {
+    await fs.rm(lockDir, { recursive: true, force: true });
+  }
+}
+
+async function acquireLock(lockDir: string, attempt = 0): Promise<void> {
+  await fs.mkdir(path.dirname(lockDir), { recursive: true });
+  try {
+    await fs.mkdir(lockDir);
+  } catch (err) {
+    if (!isFileExistsError(err) || attempt >= 200) throw err;
+    await delay(50);
+    await acquireLock(lockDir, attempt + 1);
+  }
+}
+
+function isFileExistsError(err: unknown): boolean {
+  return err instanceof Error && "code" in err && err.code === "EEXIST";
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function repoSpecifierFromScope(scope: CleanupScope): RepoSpecifier | null {

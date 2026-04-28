@@ -126,6 +126,12 @@ async function createBareCleanupTree(numbers: ReadonlyArray<number> = [1]): Prom
   };
 }
 
+async function createGitDirectoryWithRemote(directory: string, remote: string): Promise<void> {
+  await fs.mkdir(directory, { recursive: true });
+  await run("git", ["init"], { cwd: directory });
+  await run("git", ["remote", "add", "origin", remote], { cwd: directory });
+}
+
 async function createGitWorktreeFixture(): Promise<GitWorktreeFixture> {
   const temp = await makeTempRoot();
   const home = path.join(temp, "home");
@@ -180,12 +186,19 @@ function escapeRegExp(value: string): string {
 }
 
 beforeAll(async () => {
-  if (!(await pathExists(CLI_PATH))) {
-    await run("pnpm", ["build"], { cwd: REPO_ROOT });
-  }
+  await run("pnpm", ["build"], { cwd: REPO_ROOT });
 }, 15_000);
 
 describe("cleanup CLI", () => {
+  it("prints cleanup help from the cleanup subcommand", async () => {
+    const fixture = await createBareCleanupTree();
+    const result = await runCli(["cleanup", "--help"], fixture.env);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toMatch(/Cleanup:/);
+    expect(result.stdout).toMatch(/cleanup --dry-run/);
+  });
+
   it("rejects --list and --dry-run together", async () => {
     const fixture = await createBareCleanupTree();
     const result = await runCli(["cleanup", "--list", "--dry-run"], fixture.env);
@@ -238,6 +251,15 @@ describe("cleanup CLI", () => {
     expect(await pathExists(path.join(fixture.worktreesRoot, SLUG, "2"))).toBe(true);
   });
 
+  it("refuses broad repo removal without --yes even when one worktree matches", async () => {
+    const fixture = await createBareCleanupTree([1]);
+    const result = await runCli(["cleanup", `${OWNER}/${REPO}`], fixture.env);
+
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/--yes/);
+    expect(await pathExists(path.join(fixture.worktreesRoot, SLUG, "1"))).toBe(true);
+  });
+
   it("allows broad non-TTY removal with --yes", async () => {
     const fixture = await createBareCleanupTree([1, 2]);
     const result = await runCli(["cleanup", "--all", "--yes"], fixture.env);
@@ -249,6 +271,41 @@ describe("cleanup CLI", () => {
 });
 
 describe("cleanupTargets", () => {
+  it.skipIf(process.platform === "win32")("listCleanupTargets excludes repo-scope slug collisions with mismatched remotes", async () => {
+    const fixture = await createBareCleanupTree([]);
+    const collidingSlug = "foo-bar-baz";
+    const collidingWorktree = path.join(fixture.worktreesRoot, collidingSlug, "1");
+    await createGitDirectoryWithRemote(collidingWorktree, "https://github.com/foo-bar/baz.git");
+
+    await withEnv(fixture.env, async () => {
+      const targets = await listCleanupTargets({ kind: "repo", owner: "foo", repo: "bar-baz" });
+
+      expect(targets).toEqual([]);
+    });
+  });
+
+  it.skipIf(process.platform === "win32")("cleanupTargets rejects dangerously broad worktrees roots", async () => {
+    const temp = await makeTempRoot();
+    const targetPath = path.join(temp, SLUG, "123");
+    await fs.mkdir(targetPath, { recursive: true });
+    const target: CleanupTarget = {
+      slug: SLUG,
+      number: 123,
+      worktreePath: targetPath,
+      sizeBytes: 0,
+      owner: OWNER,
+      repo: REPO,
+      localClonePath: null,
+    };
+
+    await withEnv({ CAIRN_WORKTREES_ROOT: path.parse(temp).root }, async () => {
+      await expect(cleanupTargets([target], { dryRun: false })).rejects.toThrow(
+        /Refusing to use unsafe worktrees root/,
+      );
+      expect(await pathExists(targetPath)).toBe(true);
+    });
+  });
+
   it.skipIf(process.platform === "win32")("listCleanupTargets finds a real git worktree under the injected root", async () => {
     const fixture = await createGitWorktreeFixture();
 
@@ -311,6 +368,26 @@ describe("cleanupTargets", () => {
       expect(result.method).toBe("rm-rf");
       expect(result.warning).toMatch(/parent clone not found/);
       expect(await pathExists(target.worktreePath)).toBe(false);
+    });
+  });
+
+  it.skipIf(process.platform === "win32")("cleanupTargets does not rm-rf when git worktree removal fails from a parent clone", async () => {
+    const fixture = await createBareCleanupTree([123]);
+    const target: CleanupTarget = {
+      slug: SLUG,
+      number: 123,
+      worktreePath: path.join(fixture.worktreesRoot, SLUG, "123"),
+      sizeBytes: 0,
+      owner: OWNER,
+      repo: REPO,
+      localClonePath: fixture.temp,
+    };
+
+    await withEnv(fixture.env, async () => {
+      await expect(cleanupTargets([target], { dryRun: false })).rejects.toThrow(
+        /git worktree remove failed/,
+      );
+      expect(await pathExists(target.worktreePath)).toBe(true);
     });
   });
 

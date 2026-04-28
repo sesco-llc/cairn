@@ -114,12 +114,14 @@ function parseCleanupArgs(argv: string[], args: CliArgs): void {
     else if (a === "--list") args.cleanupList = true;
     else if (a === "--dry-run") args.cleanupDryRun = true;
     else if (a === "-y" || a === "--yes") args.cleanupYes = true;
+    else if (a === "-h" || a === "--help") args.command = "help";
     else if (a.startsWith("-")) throw new Error(`Unknown cleanup flag: ${a}`);
     else if (!args.cleanupTarget) args.cleanupTarget = a;
     else throw new Error(`Unexpected cleanup positional argument: ${a}`);
   }
 
   const targetCount = [args.cleanupAll, args.cleanupRepo !== null, args.cleanupTarget !== undefined].filter(Boolean).length;
+  if (args.command === "help") return;
   if (args.cleanupList && args.cleanupDryRun) throw new Error("--list and --dry-run cannot be combined.");
   if (args.cleanupDryRun && targetCount === 0) {
     throw new Error("cleanup --dry-run requires an explicit scope: --all, --repo <owner/repo>, or a positional target.");
@@ -301,7 +303,11 @@ function hasExplicitCleanupScope(args: CliArgs): boolean {
 }
 
 async function confirmCleanup(scope: CleanupScope, targets: ReadonlyArray<CleanupTarget>, yes: boolean): Promise<boolean> {
-  const needsConfirmation = scope.kind === "all" || targets.length > 1;
+  const needsConfirmation =
+    scope.kind === "all" ||
+    scope.kind === "repo" ||
+    (scope.kind === "slug" && scope.number === undefined) ||
+    targets.length > 1;
   if (!needsConfirmation || yes) return true;
 
   if (!process.stdin.isTTY) {

@@ -73,7 +73,7 @@ cd app && pnpm dev
   │ Anthropic agentic loop                             │
   │   tools: read_file / glob / grep / list_dir        │
   │          submit_review_path                        │
-  │   sandboxed to ~/.cairn/worktrees/<repo>/<n>/      │
+  │   sandboxed to ~/.cairn/worktrees/<owner>-<repo>/<n>/ │
   └────────────────────────┬───────────────────────────┘
                            │
                            ▼
