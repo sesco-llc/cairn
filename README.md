@@ -39,12 +39,18 @@ cd cairn
 pnpm install
 pnpm build
 
+# Optional: install globally so you can run `cairn` from anywhere
+# (pnpm link --global, npm link, or bun link all work)
+pnpm link --global
+
 # Viewer
 cd app && pnpm install && cd ..
 
 # Run a review
 export ANTHROPIC_API_KEY=sk-ant-...
-node dist/index.js review https://github.com/owner/repo/pull/123
+cairn review https://github.com/owner/repo/pull/123
+# (or, without the global link:)
+# node dist/index.js review https://github.com/owner/repo/pull/123
 
 # Open the viewer
 cd app && pnpm dev
