@@ -1,10 +1,16 @@
 # Cairn
 
-> AI-era PR review for engineers who actually have to read the diff.
+> Most AI review tools see the diff. Cairn sees the diff **and** your actual codebase.
 
-Cairn turns a pull request into an **ordered Review Path** — a stepwise reading plan with risk-scored chunks, smell flags, and inline annotations anchored to specific lines. Claude explores the full repo at the PR's head SHA via tools (`read_file`, `glob`, `grep`, `list_dir`), so the review is grounded in your actual code, not just the diff.
+<!-- Drop the hero screenshot URL here. Paste an image into a draft GitHub issue
+     to get a permanent user-images.githubusercontent.com URL, then replace src. -->
+<p align="center">
+  <img src="https://user-images.githubusercontent.com/REPLACE_ME/hero.png" alt="Cairn review viewer" width="900">
+</p>
 
-100% local. Your code is never uploaded anywhere — only the AI request goes to Anthropic's API, and only with context you control.
+Cairn turns a pull request into an **ordered Review Path** — a stepwise reading plan with risk-scored chunks, smell flags, and inline annotations anchored to specific lines. The CLI clones a detached worktree at the PR's head SHA and gives Claude tools (`read_file`, `glob`, `grep`, `list_dir`) while it builds the review, so the output is grounded in your actual code, not just the diff.
+
+100% local. Your code is never uploaded anywhere — only the AI request goes to Anthropic's API, and only with context you control. MIT licensed, BYOK.
 
 ## Why
 
