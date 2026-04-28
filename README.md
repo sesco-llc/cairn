@@ -113,7 +113,7 @@ The viewer renders this as: a left-rail step list with risk pills, an active-ste
 
 ```
 cairn-app review <github-pr-url> [flags]
-cairn-app cleanup [github-pr-url | owner-repo[/number]] [flags]
+cairn-app cleanup [github-pr-url | owner/repo | owner-repo[/number]] [flags]
 ```
 
 ### Review
@@ -135,11 +135,22 @@ cairn-app cleanup [github-pr-url | owner-repo[/number]] [flags]
 
 | Command / flag | Notes |
 | --- | --- |
+| `cairn-app cleanup` | List worktrees with disk usage, no removal |
 | `cairn-app cleanup <pr-url>` | Remove that PR's worktree |
+| `cairn-app cleanup <owner>/<repo>` | Remove all worktrees for a repo |
+| `cairn-app cleanup <owner-repo>[/number]` | Legacy slug form, still accepted |
 | `cairn-app cleanup --all` | Remove every worktree under `~/.cairn/worktrees/` |
 | `cairn-app cleanup --repo <owner>/<repo>` | Remove all worktrees for a repo |
 | `cairn-app cleanup --list` | List worktrees with disk usage, no removal |
-| `cairn-app cleanup --dry-run` | Print what would be removed and the size that would be freed |
+| `cairn-app cleanup --dry-run` | Print what would be removed; requires `--all`, `--repo`, or a positional target |
+| `cairn-app cleanup -y, --yes` | Skip confirmation for broad destructive cleanup |
+
+### Environment variables
+
+| Variable | Notes |
+| --- | --- |
+| `ANTHROPIC_API_KEY` | Required for reviews |
+| `CAIRN_WORKTREES_ROOT` | Override the cleanup/worktree root; useful for tests |
 
 ## Privacy & data flow
 

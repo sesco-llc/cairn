@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
 import { fetchPRDiff, fetchPRMeta, parsePRUrl } from "./github.js";
 import { buildUserPrompt, getSystemPrompt } from "./prompt.js";
 import { callReviewPath, callReviewPathAgentic } from "./anthropic.js";
@@ -33,6 +34,7 @@ interface CliArgs {
   cleanupRepo: string | null;
   cleanupList: boolean;
   cleanupDryRun: boolean;
+  cleanupYes: boolean;
 }
 
 const DEFAULTS = {
@@ -60,6 +62,7 @@ function parseArgs(argv: string[]): CliArgs {
     cleanupRepo: null,
     cleanupList: false,
     cleanupDryRun: false,
+    cleanupYes: false,
   };
 
   if (argv.length === 0) return args;
@@ -110,13 +113,20 @@ function parseCleanupArgs(argv: string[], args: CliArgs): void {
     else if (a === "--repo") args.cleanupRepo = required(argv, ++i, "--repo");
     else if (a === "--list") args.cleanupList = true;
     else if (a === "--dry-run") args.cleanupDryRun = true;
+    else if (a === "-y" || a === "--yes") args.cleanupYes = true;
     else if (a.startsWith("-")) throw new Error(`Unknown cleanup flag: ${a}`);
     else if (!args.cleanupTarget) args.cleanupTarget = a;
     else throw new Error(`Unexpected cleanup positional argument: ${a}`);
   }
 
   const targetCount = [args.cleanupAll, args.cleanupRepo !== null, args.cleanupTarget !== undefined].filter(Boolean).length;
-  if (targetCount > 1) throw new Error("Use only one cleanup target: --all, --repo, or a positional PR URL/slug.");
+  if (args.cleanupList && args.cleanupDryRun) throw new Error("--list and --dry-run cannot be combined.");
+  if (args.cleanupDryRun && targetCount === 0) {
+    throw new Error("cleanup --dry-run requires an explicit scope: --all, --repo <owner/repo>, or a positional target.");
+  }
+  if (targetCount > 1) {
+    throw new Error("Use only one cleanup target: --all, --repo, GitHub PR URL, owner/repo, or owner-repo[/number].");
+  }
 }
 
 function required(argv: string[], i: number, name: string): string {
@@ -131,7 +141,7 @@ function printHelp(): void {
 
 Usage:
   cairn-app review <github-pr-url> [flags]
-  cairn-app cleanup [github-pr-url | owner-repo[/number]] [flags]
+  cairn-app cleanup [github-pr-url | owner/repo | owner-repo[/number]] [flags]
 
 Repo context (default: on if a local clone is found):
   Looks for an existing clone of <owner>/<repo> in your machine, fetches the
@@ -156,13 +166,16 @@ Flags:
 
 Cleanup:
   cleanup <pr-url>        Remove one PR worktree
+  cleanup <owner/repo>    Remove all worktrees for owner/repo
   cleanup --all           Remove every Cairn worktree
   cleanup --repo <o/r>    Remove all worktrees for owner/repo
   cleanup --list          List worktrees and sizes without removing
-  cleanup --dry-run       Print what would be removed
+  cleanup --dry-run       Print what would be removed; requires an explicit scope
+  cleanup -y, --yes       Skip confirmation for broad destructive cleanup
 
 Environment:
   ANTHROPIC_API_KEY   required
+  CAIRN_WORKTREES_ROOT override the default ~/.cairn/worktrees cleanup root
   gh CLI authenticated for fetching PR metadata
 `,
   );
@@ -263,11 +276,11 @@ async function main(): Promise<void> {
 }
 
 async function runCleanup(args: CliArgs): Promise<void> {
-  const scope = cleanupScope(args);
+  const explicitScope = hasExplicitCleanupScope(args);
+  const scope: CleanupScope = explicitScope ? cleanupScope(args) : { kind: "all" };
   const targets = await listCleanupTargets(scope);
-  const shouldAct = args.cleanupAll || args.cleanupRepo !== null || args.cleanupTarget !== undefined || args.cleanupDryRun;
 
-  if (args.cleanupList || !shouldAct) {
+  if (args.cleanupList || !explicitScope) {
     printCleanupList(targets);
     return;
   }
@@ -277,8 +290,33 @@ async function runCleanup(args: CliArgs): Promise<void> {
     return;
   }
 
+  if (!args.cleanupDryRun && !(await confirmCleanup(scope, targets, args.cleanupYes))) return;
+
   const results = await cleanupTargets(targets, { dryRun: args.cleanupDryRun });
   printCleanupResults(results, args.cleanupDryRun);
+}
+
+function hasExplicitCleanupScope(args: CliArgs): boolean {
+  return args.cleanupAll || args.cleanupRepo !== null || args.cleanupTarget !== undefined;
+}
+
+async function confirmCleanup(scope: CleanupScope, targets: ReadonlyArray<CleanupTarget>, yes: boolean): Promise<boolean> {
+  const needsConfirmation = scope.kind === "all" || targets.length > 1;
+  if (!needsConfirmation || yes) return true;
+
+  if (!process.stdin.isTTY) {
+    throw new Error(`Refusing to remove ${formatCount(targets.length)} in non-interactive mode. Pass --yes to confirm.`);
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = await rl.question(`About to remove ${formatCount(targets.length)} freeing ${formatBytes(totalSize(targets))}. Continue? [y/N] `);
+    if (/^(y|yes)$/i.test(answer.trim())) return true;
+    process.stdout.write("Cancelled.\n");
+    return false;
+  } finally {
+    rl.close();
+  }
 }
 
 function cleanupScope(args: CliArgs): CleanupScope {
@@ -295,10 +333,19 @@ function cleanupScopeFromTarget(target: string): CleanupScope {
     const { owner, repo, number } = parsePRUrl(target);
     return { kind: "pr", owner, repo, number };
   } catch {
-    const match = target.match(/^([^/\s]+)(?:\/(\d+))?$/);
+    const repoMatch = target.match(/^([^/\s]+)\/([^/\s]+)$/);
+    const owner = repoMatch?.[1];
+    const repo = repoMatch?.[2];
+    if (owner && repo && !/^\d+$/.test(repo)) return { kind: "repo", owner, repo };
+
+    const match = target.match(/^([A-Za-z0-9._-]+)(?:\/(\d+))?$/);
     const slug = match?.[1];
     const number = match?.[2] ? Number(match[2]) : undefined;
-    if (!slug) throw new Error("Cleanup target must be a GitHub PR URL, repo slug, or repo-slug/number.");
+    if (!slug) {
+      throw new Error(
+        "Cleanup target must be a GitHub PR URL, owner/repo, or owner-repo[/number].",
+      );
+    }
     return number === undefined ? { kind: "slug", slug } : { kind: "slug", slug, number };
   }
 }

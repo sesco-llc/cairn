@@ -75,7 +75,8 @@ async function pathExists(p: string): Promise<boolean> {
 }
 
 export function worktreesRoot(): string {
-  return path.join(os.homedir(), ".cairn", "worktrees");
+  const override = process.env.CAIRN_WORKTREES_ROOT;
+  return override ? path.resolve(override) : path.join(os.homedir(), ".cairn", "worktrees");
 }
 
 export function repoSlug(owner: string, repo: string): string {
@@ -242,7 +243,34 @@ export async function listCleanupTargets(scope: CleanupScope): Promise<CleanupTa
 }
 
 export async function cleanupTargets(targets: CleanupTarget[], options: CleanupOptions): Promise<CleanupResult[]> {
-  return Promise.all(targets.map((target) => cleanupTarget(target, options)));
+  if (!options.dryRun) targets.forEach(assertSafeCleanupPath);
+
+  const indexedTargets = targets.map((target, index) => ({ target, index }));
+  const initialGroups: Record<string, typeof indexedTargets> = {};
+  const groups = Object.values(
+    indexedTargets.reduce((grouped, item) => {
+      const groupKey = item.target.localClonePath ?? "__cairn_missing_parent_clone__";
+      return {
+        ...grouped,
+        [groupKey]: [...(grouped[groupKey] ?? []), item],
+      };
+    }, initialGroups),
+  );
+  const results: Array<CleanupResult | undefined> = new Array(targets.length);
+
+  await Promise.all(
+    groups.map((group) =>
+      group.reduce<Promise<void>>(async (previous, item) => {
+        await previous;
+        results[item.index] = await cleanupTarget(item.target, options);
+      }, Promise.resolve()),
+    ),
+  );
+
+  return results.map((result) => {
+    if (result === undefined) throw new Error("cleanup result missing");
+    return result;
+  });
 }
 
 async function cleanupTarget(target: CleanupTarget, options: CleanupOptions): Promise<CleanupResult> {
@@ -250,14 +278,16 @@ async function cleanupTarget(target: CleanupTarget, options: CleanupOptions): Pr
     return { ...target, method: "dry-run", removed: false, warning: null };
   }
 
+  const worktreePath = assertSafeCleanupPath(target);
+
   if (target.localClonePath) {
     try {
-      await run("git", ["worktree", "remove", "--force", target.worktreePath], { cwd: target.localClonePath });
-      await removeEmptyParents(target.worktreePath);
+      await run("git", ["worktree", "remove", "--force", worktreePath], { cwd: target.localClonePath });
+      await removeEmptyParents(worktreePath);
       return { ...target, method: "git-worktree-remove", removed: true, warning: null };
     } catch (err) {
-      await fs.rm(target.worktreePath, { recursive: true, force: true });
-      await removeEmptyParents(target.worktreePath);
+      await fs.rm(worktreePath, { recursive: true, force: true });
+      await removeEmptyParents(worktreePath);
       return {
         ...target,
         method: "rm-rf",
@@ -267,14 +297,26 @@ async function cleanupTarget(target: CleanupTarget, options: CleanupOptions): Pr
     }
   }
 
-  await fs.rm(target.worktreePath, { recursive: true, force: true });
-  await removeEmptyParents(target.worktreePath);
+  await fs.rm(worktreePath, { recursive: true, force: true });
+  await removeEmptyParents(worktreePath);
   return {
     ...target,
     method: "rm-rf",
     removed: true,
     warning: `parent clone not found for ${target.worktreePath}; removed directory with rm -rf. Run git worktree prune in the parent clone if stale entries remain.`,
   };
+}
+
+function assertSafeCleanupPath(target: CleanupTarget): string {
+  const root = path.resolve(worktreesRoot());
+  const worktreePath = path.resolve(target.worktreePath);
+  const rootPrefix = root.endsWith(path.sep) ? root : `${root}${path.sep}`;
+
+  if (!worktreePath.startsWith(rootPrefix)) {
+    throw new Error(`Refusing to remove cleanup target outside ${root}: ${target.worktreePath}`);
+  }
+
+  return worktreePath;
 }
 
 function matchesSlug(scope: CleanupScope, slug: string): boolean {
