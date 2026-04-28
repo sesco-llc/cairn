@@ -5,8 +5,11 @@
 <!-- Drop the hero screenshot URL here. Paste an image into a draft GitHub issue
      to get a permanent user-images.githubusercontent.com URL, then replace src. -->
 <p align="center">
-  <img src="https://user-images.githubusercontent.com/REPLACE_ME/hero.png" alt="Cairn review viewer" width="900">
+    <img width="2168" height="1247" alt="image" src="https://github.com/user-attachments/assets/5d19a1cc-5255-4377-9a3e-a39b05b5507b" />
 </p>
+
+
+
 
 Cairn turns a pull request into an **ordered Review Path** — a stepwise reading plan with risk-scored chunks, smell flags, and inline annotations anchored to specific lines. The CLI clones a detached worktree at the PR's head SHA and gives Claude tools (`read_file`, `glob`, `grep`, `list_dir`) while it builds the review, so the output is grounded in your actual code, not just the diff.
 
