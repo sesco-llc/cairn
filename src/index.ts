@@ -5,10 +5,18 @@ import { buildUserPrompt, getSystemPrompt } from "./prompt.js";
 import { callReviewPath, callReviewPathAgentic } from "./anthropic.js";
 import { renderMarkdown } from "./render.js";
 import { writeReview } from "./store.js";
-import { addWorktreeFromLocal, findLocalClone } from "./worktree.js";
+import {
+  addWorktreeFromLocal,
+  cleanupTargets,
+  findLocalClone,
+  formatBytes,
+  listCleanupTargets,
+  parseRepoSpecifier,
+} from "./worktree.js";
+import type { CleanupResult, CleanupScope, CleanupTarget } from "./worktree.js";
 
 interface CliArgs {
-  command: "review" | "help" | "version";
+  command: "review" | "cleanup" | "help" | "version";
   url?: string;
   model: string;
   maxFiles: number;
@@ -20,6 +28,11 @@ interface CliArgs {
   noContext: boolean;
   repoPath: string | null;
   maxIterations: number;
+  cleanupTarget?: string;
+  cleanupAll: boolean;
+  cleanupRepo: string | null;
+  cleanupList: boolean;
+  cleanupDryRun: boolean;
 }
 
 const DEFAULTS = {
@@ -43,14 +56,23 @@ function parseArgs(argv: string[]): CliArgs {
     noContext: false,
     repoPath: null,
     maxIterations: DEFAULTS.maxIterations,
+    cleanupAll: false,
+    cleanupRepo: null,
+    cleanupList: false,
+    cleanupDryRun: false,
   };
 
   if (argv.length === 0) return args;
 
-  const first = argv[0]!;
+  const first = argv[0];
   if (first === "-h" || first === "--help" || first === "help") return args;
   if (first === "-v" || first === "--version") {
     args.command = "version";
+    return args;
+  }
+  if (first === "cleanup") {
+    args.command = "cleanup";
+    parseCleanupArgs(argv, args);
     return args;
   }
   if (first !== "review") {
@@ -59,7 +81,8 @@ function parseArgs(argv: string[]): CliArgs {
   args.command = "review";
 
   for (let i = 1; i < argv.length; i++) {
-    const a = argv[i]!;
+    const a = argv[i];
+    if (a === undefined) continue;
     if (a === "--model") args.model = required(argv, ++i, "--model");
     else if (a === "--max-files") args.maxFiles = Number(required(argv, ++i, "--max-files"));
     else if (a === "--diff-bytes") args.diffByteCap = Number(required(argv, ++i, "--diff-bytes"));
@@ -79,6 +102,23 @@ function parseArgs(argv: string[]): CliArgs {
   return args;
 }
 
+function parseCleanupArgs(argv: string[], args: CliArgs): void {
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === undefined) continue;
+    if (a === "--all") args.cleanupAll = true;
+    else if (a === "--repo") args.cleanupRepo = required(argv, ++i, "--repo");
+    else if (a === "--list") args.cleanupList = true;
+    else if (a === "--dry-run") args.cleanupDryRun = true;
+    else if (a.startsWith("-")) throw new Error(`Unknown cleanup flag: ${a}`);
+    else if (!args.cleanupTarget) args.cleanupTarget = a;
+    else throw new Error(`Unexpected cleanup positional argument: ${a}`);
+  }
+
+  const targetCount = [args.cleanupAll, args.cleanupRepo !== null, args.cleanupTarget !== undefined].filter(Boolean).length;
+  if (targetCount > 1) throw new Error("Use only one cleanup target: --all, --repo, or a positional PR URL/slug.");
+}
+
 function required(argv: string[], i: number, name: string): string {
   const v = argv[i];
   if (v === undefined) throw new Error(`Flag ${name} requires a value.`);
@@ -91,6 +131,7 @@ function printHelp(): void {
 
 Usage:
   cairn-app review <github-pr-url> [flags]
+  cairn-app cleanup [github-pr-url | owner-repo[/number]] [flags]
 
 Repo context (default: on if a local clone is found):
   Looks for an existing clone of <owner>/<repo> in your machine, fetches the
@@ -113,6 +154,13 @@ Flags:
   --debug             Print prompt/token usage to stderr
   -h, --help / -v, --version
 
+Cleanup:
+  cleanup <pr-url>        Remove one PR worktree
+  cleanup --all           Remove every Cairn worktree
+  cleanup --repo <o/r>    Remove all worktrees for owner/repo
+  cleanup --list          List worktrees and sizes without removing
+  cleanup --dry-run       Print what would be removed
+
 Environment:
   ANTHROPIC_API_KEY   required
   gh CLI authenticated for fetching PR metadata
@@ -125,7 +173,7 @@ async function main(): Promise<void> {
   try {
     args = parseArgs(process.argv.slice(2));
   } catch (err) {
-    process.stderr.write(`error: ${(err as Error).message}\n`);
+    process.stderr.write(`error: ${errorMessage(err)}\n`);
     process.exit(2);
   }
 
@@ -134,10 +182,16 @@ async function main(): Promise<void> {
     process.stdout.write("cairn-app 0.3.0\n");
     return;
   }
+  if (args.command === "cleanup") {
+    await runCleanup(args);
+    return;
+  }
 
   const log = (msg: string) => process.stderr.write(`[${new Date().toLocaleTimeString()}] ${msg}\n`);
 
-  const { owner, repo, number } = parsePRUrl(args.url!);
+  const url = args.url;
+  if (!url) throw new Error("Missing GitHub PR URL. Usage: cairn-app review <url>");
+  const { owner, repo, number } = parsePRUrl(url);
   log(`fetching PR ${owner}/${repo}#${number}…`);
   const meta = await fetchPRMeta(owner, repo, number);
   const headSha = meta.commits[meta.commits.length - 1]?.oid;
@@ -162,7 +216,7 @@ async function main(): Promise<void> {
         const wt = await addWorktreeFromLocal(localClone, owner, repo, number, headSha, log);
         worktreePath = wt.worktreePath;
       } catch (err) {
-        log(`failed to set up worktree: ${(err as Error).message}`);
+        log(`failed to set up worktree: ${errorMessage(err)}`);
         log(`falling back to diff-only review`);
       }
     } else {
@@ -175,12 +229,12 @@ async function main(): Promise<void> {
   const systemPrompt = getSystemPrompt(hasRepoContext);
 
   log(hasRepoContext ? `running agentic review with repo context…` : `running diff-only review…`);
-  const reviewPath = hasRepoContext
+  const reviewPath = worktreePath
     ? await callReviewPathAgentic({
         model: args.model,
         systemPrompt,
         userPrompt,
-        worktreePath: worktreePath!,
+        worktreePath,
         maxIterations: args.maxIterations,
         debug: args.debug,
         log,
@@ -208,7 +262,85 @@ async function main(): Promise<void> {
   }
 }
 
+async function runCleanup(args: CliArgs): Promise<void> {
+  const scope = cleanupScope(args);
+  const targets = await listCleanupTargets(scope);
+  const shouldAct = args.cleanupAll || args.cleanupRepo !== null || args.cleanupTarget !== undefined || args.cleanupDryRun;
+
+  if (args.cleanupList || !shouldAct) {
+    printCleanupList(targets);
+    return;
+  }
+
+  if (targets.length === 0) {
+    process.stdout.write("No matching worktrees found.\n");
+    return;
+  }
+
+  const results = await cleanupTargets(targets, { dryRun: args.cleanupDryRun });
+  printCleanupResults(results, args.cleanupDryRun);
+}
+
+function cleanupScope(args: CliArgs): CleanupScope {
+  if (args.cleanupRepo) {
+    const { owner, repo } = parseRepoSpecifier(args.cleanupRepo);
+    return { kind: "repo", owner, repo };
+  }
+  if (args.cleanupTarget) return cleanupScopeFromTarget(args.cleanupTarget);
+  return { kind: "all" };
+}
+
+function cleanupScopeFromTarget(target: string): CleanupScope {
+  try {
+    const { owner, repo, number } = parsePRUrl(target);
+    return { kind: "pr", owner, repo, number };
+  } catch {
+    const match = target.match(/^([^/\s]+)(?:\/(\d+))?$/);
+    const slug = match?.[1];
+    const number = match?.[2] ? Number(match[2]) : undefined;
+    if (!slug) throw new Error("Cleanup target must be a GitHub PR URL, repo slug, or repo-slug/number.");
+    return number === undefined ? { kind: "slug", slug } : { kind: "slug", slug, number };
+  }
+}
+
+function printCleanupList(targets: CleanupTarget[]): void {
+  if (targets.length === 0) {
+    process.stdout.write("No worktrees found.\n");
+    return;
+  }
+
+  targets.forEach((target) => {
+    process.stdout.write(`${targetLabel(target)}  ${formatBytes(target.sizeBytes)}  ${target.worktreePath}\n`);
+  });
+  process.stdout.write(`Total: ${formatBytes(totalSize(targets))} across ${formatCount(targets.length)}.\n`);
+}
+
+function printCleanupResults(results: CleanupResult[], dryRun: boolean): void {
+  results.forEach((result) => {
+    process.stdout.write(`${dryRun ? "would remove" : "removed"} ${result.worktreePath} (${formatBytes(result.sizeBytes)})\n`);
+    if (result.warning) process.stderr.write(`warning: ${result.warning}\n`);
+  });
+
+  process.stdout.write(`${dryRun ? "Would free" : "Freed"} ${formatBytes(totalSize(results))} across ${formatCount(results.length)}.\n`);
+}
+
+function targetLabel(target: CleanupTarget): string {
+  return target.owner && target.repo ? `${target.owner}/${target.repo}#${target.number}` : `${target.slug}/${target.number}`;
+}
+
+function totalSize(targets: ReadonlyArray<CleanupTarget>): number {
+  return targets.reduce((sum, target) => sum + target.sizeBytes, 0);
+}
+
+function formatCount(count: number): string {
+  return `${count} worktree${count === 1 ? "" : "s"}`;
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 main().catch((err) => {
-  process.stderr.write(`error: ${(err as Error).message}\n`);
+  process.stderr.write(`error: ${errorMessage(err)}\n`);
   process.exit(1);
 });

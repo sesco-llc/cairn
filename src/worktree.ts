@@ -12,6 +12,37 @@ export interface WorktreeInfo {
   ephemeral: boolean;
 }
 
+export interface RepoSpecifier {
+  owner: string;
+  repo: string;
+}
+
+export type CleanupScope =
+  | { kind: "all" }
+  | { kind: "repo"; owner: string; repo: string }
+  | { kind: "pr"; owner: string; repo: string; number: number }
+  | { kind: "slug"; slug: string; number?: number };
+
+export interface CleanupTarget {
+  slug: string;
+  number: number;
+  worktreePath: string;
+  sizeBytes: number;
+  owner: string | null;
+  repo: string | null;
+  localClonePath: string | null;
+}
+
+export interface CleanupResult extends CleanupTarget {
+  method: "dry-run" | "git-worktree-remove" | "rm-rf";
+  removed: boolean;
+  warning: string | null;
+}
+
+interface CleanupOptions {
+  dryRun: boolean;
+}
+
 interface RunOptions {
   cwd?: string;
 }
@@ -43,8 +74,39 @@ async function pathExists(p: string): Promise<boolean> {
   }
 }
 
-function worktreesRoot(): string {
+export function worktreesRoot(): string {
   return path.join(os.homedir(), ".cairn", "worktrees");
+}
+
+export function repoSlug(owner: string, repo: string): string {
+  return `${owner}-${repo}`;
+}
+
+export function worktreePathForPR(owner: string, repo: string, number: number): string {
+  return path.join(worktreesRoot(), repoSlug(owner, repo), String(number));
+}
+
+export function parseRepoSpecifier(value: string): RepoSpecifier {
+  const match = value.match(/^([^/\s]+)\/([^/\s]+)$/);
+  const owner = match?.[1];
+  const repo = match?.[2];
+  if (!owner || !repo) throw new Error(`Expected repo as owner/repo: ${value}`);
+  return { owner, repo };
+}
+
+export function parseGitHubRemote(remote: string): RepoSpecifier | null {
+  const normalized = remote.trim().replace(/\/$/, "").replace(/\.git$/, "");
+  const match = normalized.match(/github\.com[:/]([^/\s:]+)\/([^/\s]+)$/);
+  const owner = match?.[1];
+  const repo = match?.[2];
+  return owner && repo ? { owner, repo } : null;
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)} GB`;
 }
 
 /**
@@ -121,8 +183,7 @@ export async function addWorktreeFromLocal(
   headSha: string,
   log: (msg: string) => void = () => {},
 ): Promise<WorktreeInfo> {
-  const slug = `${owner}-${repo}`;
-  const worktreePath = path.join(worktreesRoot(), slug, String(number));
+  const worktreePath = worktreePathForPR(owner, repo, number);
   await fs.mkdir(path.dirname(worktreePath), { recursive: true });
 
   log(`fetching PR #${number} into ${path.basename(localClonePath)}…`);
@@ -147,4 +208,137 @@ export async function addWorktreeFromLocal(
   }
 
   return { worktreePath, localClonePath, headSha, ephemeral: false };
+}
+
+export async function listCleanupTargets(scope: CleanupScope): Promise<CleanupTarget[]> {
+  const root = worktreesRoot();
+  if (!(await pathExists(root))) return [];
+
+  const slugEntries = await fs.readdir(root, { withFileTypes: true }).catch(() => []);
+  const slugNames = slugEntries
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .filter((slug) => matchesSlug(scope, slug))
+    .sort((a, b) => a.localeCompare(b));
+
+  const nestedTargets = await Promise.all(
+    slugNames.map(async (slug) => {
+      const slugDir = path.join(root, slug);
+      const numberEntries = await fs.readdir(slugDir, { withFileTypes: true }).catch(() => []);
+      const numberNames = numberEntries
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name)
+        .filter((numberName) => /^\d+$/.test(numberName))
+        .filter((numberName) => matchesNumber(scope, Number(numberName)))
+        .sort((a, b) => Number(a) - Number(b));
+
+      return Promise.all(
+        numberNames.map((numberName) => buildCleanupTarget(scope, slug, Number(numberName), path.join(slugDir, numberName))),
+      );
+    }),
+  );
+
+  return nestedTargets.flat();
+}
+
+export async function cleanupTargets(targets: CleanupTarget[], options: CleanupOptions): Promise<CleanupResult[]> {
+  return Promise.all(targets.map((target) => cleanupTarget(target, options)));
+}
+
+async function cleanupTarget(target: CleanupTarget, options: CleanupOptions): Promise<CleanupResult> {
+  if (options.dryRun) {
+    return { ...target, method: "dry-run", removed: false, warning: null };
+  }
+
+  if (target.localClonePath) {
+    try {
+      await run("git", ["worktree", "remove", "--force", target.worktreePath], { cwd: target.localClonePath });
+      await removeEmptyParents(target.worktreePath);
+      return { ...target, method: "git-worktree-remove", removed: true, warning: null };
+    } catch (err) {
+      await fs.rm(target.worktreePath, { recursive: true, force: true });
+      await removeEmptyParents(target.worktreePath);
+      return {
+        ...target,
+        method: "rm-rf",
+        removed: true,
+        warning: `git worktree remove failed for ${target.worktreePath}; removed directory with rm -rf. Run git worktree prune in the parent clone if stale entries remain. ${errorMessage(err)}`,
+      };
+    }
+  }
+
+  await fs.rm(target.worktreePath, { recursive: true, force: true });
+  await removeEmptyParents(target.worktreePath);
+  return {
+    ...target,
+    method: "rm-rf",
+    removed: true,
+    warning: `parent clone not found for ${target.worktreePath}; removed directory with rm -rf. Run git worktree prune in the parent clone if stale entries remain.`,
+  };
+}
+
+function matchesSlug(scope: CleanupScope, slug: string): boolean {
+  if (scope.kind === "all") return true;
+  if (scope.kind === "repo" || scope.kind === "pr") return slug === repoSlug(scope.owner, scope.repo);
+  return slug === scope.slug;
+}
+
+function matchesNumber(scope: CleanupScope, number: number): boolean {
+  if (scope.kind === "pr") return number === scope.number;
+  if (scope.kind === "slug" && scope.number !== undefined) return number === scope.number;
+  return true;
+}
+
+async function buildCleanupTarget(
+  scope: CleanupScope,
+  slug: string,
+  number: number,
+  worktreePath: string,
+): Promise<CleanupTarget> {
+  const repoFromScope = repoSpecifierFromScope(scope);
+  const repoFromRemote = repoFromScope ?? (await readRepoFromWorktree(worktreePath));
+  const localClonePath = repoFromRemote ? await findLocalClone(repoFromRemote.owner, repoFromRemote.repo) : null;
+
+  return {
+    slug,
+    number,
+    worktreePath,
+    sizeBytes: await diskUsageBytes(worktreePath),
+    owner: repoFromRemote?.owner ?? null,
+    repo: repoFromRemote?.repo ?? null,
+    localClonePath,
+  };
+}
+
+function repoSpecifierFromScope(scope: CleanupScope): RepoSpecifier | null {
+  if (scope.kind === "repo" || scope.kind === "pr") return { owner: scope.owner, repo: scope.repo };
+  return null;
+}
+
+async function readRepoFromWorktree(worktreePath: string): Promise<RepoSpecifier | null> {
+  try {
+    const remote = await run("git", ["remote", "get-url", "origin"], { cwd: worktreePath });
+    return parseGitHubRemote(remote);
+  } catch {
+    return null;
+  }
+}
+
+async function diskUsageBytes(p: string): Promise<number> {
+  try {
+    const out = await run("du", ["-sk", p]);
+    const kilobytes = Number(out.trim().split(/\s+/)[0]);
+    return Number.isFinite(kilobytes) ? kilobytes * 1024 : 0;
+  } catch {
+    return 0;
+  }
+}
+
+async function removeEmptyParents(worktreePath: string): Promise<void> {
+  await fs.rmdir(path.dirname(worktreePath)).catch(() => {});
+  await fs.rmdir(worktreesRoot()).catch(() => {});
+}
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
 }

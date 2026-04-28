@@ -101,6 +101,8 @@ Found a clone? Cairn fetches the PR ref into it and creates a **detached** workt
 
 No clone? Pass `--repo <path>` to override, or `--no-context` to review the diff alone.
 
+To reclaim disk from old detached review worktrees, run `cairn-app cleanup --list` to inspect them, then remove a single PR, a repo, or everything with the cleanup commands below.
+
 ### Output
 
 Per step the AI returns: `title`, `rationale`, `files`, `commits`, `risk` (low/med/high), `confidence` (0–1), `smells[]`, and `annotations[]` anchoring concerns to specific files + line ranges. Plus an `overall` block (summary, headline concerns, overall risk).
@@ -111,7 +113,10 @@ The viewer renders this as: a left-rail step list with risk pills, an active-ste
 
 ```
 cairn-app review <github-pr-url> [flags]
+cairn-app cleanup [github-pr-url | owner-repo[/number]] [flags]
 ```
+
+### Review
 
 | Flag | Default | Notes |
 | --- | --- | --- |
@@ -125,6 +130,16 @@ cairn-app review <github-pr-url> [flags]
 | `--json` | off | Print raw Review Path JSON |
 | `--stdout-only` | off | Skip writing files |
 | `--debug` | off | Print prompt + token usage to stderr |
+
+### Cleanup
+
+| Command / flag | Notes |
+| --- | --- |
+| `cairn-app cleanup <pr-url>` | Remove that PR's worktree |
+| `cairn-app cleanup --all` | Remove every worktree under `~/.cairn/worktrees/` |
+| `cairn-app cleanup --repo <owner>/<repo>` | Remove all worktrees for a repo |
+| `cairn-app cleanup --list` | List worktrees with disk usage, no removal |
+| `cairn-app cleanup --dry-run` | Print what would be removed and the size that would be freed |
 
 ## Privacy & data flow
 
